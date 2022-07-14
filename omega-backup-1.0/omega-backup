@@ -1,0 +1,621 @@
+#!/bin/bash
+####################################### 
+# Written by Mike Patrick
+# 08/14/2015
+####################################### 
+
+# Add remote SMTP capability
+# Required in my.cnf: innodb_data_file_path
+# Required in my.cnf: datadir
+
+# Include the config file
+source /etc/omega-backup.conf
+
+# Variables
+LOGFILE="/tmp/backup.log"
+START=`date +%s`
+BASEBACKDIR=$BACKDIR/full
+INCRBACKDIR=$BACKDIR/incr
+FILTERTABLES="--include=.*[.].*"
+SELF=$0
+
+# Add defaults-group to options string
+INNOBACKUPEX_FULL_BACKUP_OPTIONS="$INNOBACKUPEX_FULL_BACKUP_OPTIONS --defaults-group=$DEFAULTS_GROUP"
+INNOBACKUPEX_INCR_BACKUP_OPTIONS="$INNOBACKUPEX_INCR_BACKUP_OPTIONS --defaults-group=$DEFAULTS_GROUP"
+
+# Functions
+#############################################################################
+# Display error message and exit
+#############################################################################
+function error() {
+  echo "$1" 1>&2
+  exit 1
+}
+
+function restore() {
+  if [ "$COMPACT" = "yes" ]; then
+    INNOBACKUPEX_FULL_BACKUP_OPTIONS="$INNOBACKUPEX_FULL_BACKUP_OPTIONS --rebuild-indexes"
+    INNOBACKUPEX_INCR_BACKUP_OPTIONS="$INNOBACKUPEX_INCR_BACKUP_OPTIONS --rebuild-indexes"
+  fi
+
+  if [ -f "$MYCNF_EXTRA" ]; then
+    INNOBACKUPEX_FULL_BACKUP_OPTIONS="$INNOBACKUPEX_FULL_BACKUP_OPTIONS --defaults-extra-file=$MYCNF_EXTRA"
+    INNOBACKUPEX_INCR_BACKUP_OPTIONS="$INNOBACKUPEX_INCR_BACKUP_OPTIONS --defaults-extra-file=$MYCNF_EXTRA"
+  fi
+
+  echo "Restore started: `date`"
+
+  TMPFILE="/tmp/innobackupex-restore.$$.tmp"
+  BACKUP_SET=$1
+
+  # Verify that MySQL is shutdown
+  if $MYSQLADMIN $MYSQL_USEROPTIONS ping > /dev/null 2>&1; then
+    echo "ERROR: MySQL should be shutdown before attempting to restore the backup. Also make sure the datadir is empty before continuing."
+    exit 1
+  fi
+  
+  if [ ! -d $BACKDIR ]; then
+    error "Backup destination folder: $BACKDIR does not exist."
+  fi
+
+  BACKUP_PATH=`find $BASEBACKDIR -mindepth 1 -maxdepth 3 -type d -name "$BACKUP_SET"`
+  if [ ! -z $BACKUP_PATH ]; then
+    PARENT_DIR=`dirname $BACKUP_PATH`
+  fi
+
+  if [ ! -d $PARENT_DIR ]; then
+    error "Backup to restore: $PARENT_DIR does not exist."
+  fi
+
+  FULLBACKUP=$BACKUP_PATH
+  if [ -z $FULLBACKUP ]; then
+    BACKUP_PATH=`find $INCRBACKDIR -mindepth 1 -maxdepth 3 -type d -name "$BACKUP_SET"`
+    BACKUP=`dirname $BACKUP_PATH`
+    FULLBACKUP="$BASEBACKDIR/`basename $BACKUP`"
+  fi
+
+  if [ "$COMPRESS" = "yes" ]; then
+    echo -n "Decompressing $FULLBACKUP..."
+    $INNOBACKUPEX --decompress --parallel=$THREADS $FULLBACKUP > $TMPFILE 2>&1
+    if [ $? -eq 0 ]; then
+      echo "OK"
+    else
+      echo "ERROR"
+    fi
+    check_innobackupex_error
+  fi
+
+  PARENT_DIR=`dirname $BACKUP_PATH`
+
+  if [ $PARENT_DIR = $BASEBACKDIR ]; then
+    FULLBACKUP="$BASEBACKDIR/$BACKUP_SET"
+    echo "Restore `basename $FULLBACKUP`"
+  else
+    FULLBACKUP="$BASEBACKDIR/`basename $PARENT_DIR`"
+    if [ `dirname $PARENT_DIR` = $INCRBACKDIR ]; then
+      INCR=$BACKUP_SET
+      FULL=`basename $FULLBACKUP`
+      INCRBACKUP="$INCRBACKDIR/`basename $INCR`"
+
+      if [ ! -d $FULLBACKUP ]; then
+        error "Full backup: $FULLBACKUP does not exist."
+      fi
+    
+      echo "Restore $FULL up to incremental $INCR:"
+    
+      echo -n "Replay committed transactions on full backup..."
+      $INNOBACKUPEX --defaults-file=$MYCNF --apply-log --redo-only --use-memory=$MEMORY $FULLBACKUP > $TMPFILE 2>&1
+      if [ $? -eq 0 ]; then
+        echo "OK"
+      else
+        echo "ERROR"
+      fi
+      check_innobackupex_error
+    
+      # Apply incrementals to base backup
+      for i in `find $PARENT_DIR -mindepth 1 -maxdepth 1 -type d -printf "%P\n" | sort -n`; do
+        echo -n "Applying $i to full backup..."
+        $INNOBACKUPEX --defaults-file=$MYCNF --apply-log --redo-only --use-memory=$MEMORY $FULLBACKUP --incremental-dir=$PARENT_DIR/$i > $TMPFILE 2>&1
+        if [ $? -eq 0 ]; then
+          echo "OK"
+        else
+          echo "ERROR"
+        fi
+        check_innobackupex_error
+      
+        if [ $INCR = $i ]; then
+          break # break. we are restoring up to this incremental.
+        fi
+      done
+    else
+      error "Error: Unknown backup type!"
+    fi
+  fi
+
+  echo -n "Preparing backup..."
+  $INNOBACKUPEX --defaults-file=$MYCNF --apply-log --use-memory=$MEMORY $FULLBACKUP > $TMPFILE 2>&1
+  if [ $? -eq 0 ]; then
+    echo "OK"
+  else
+    echo "ERROR"
+  fi
+  check_innobackupex_error
+  
+  echo -n "Restoring backup..."
+  $INNOBACKUPEX --defaults-file=$MYCNF --copy-back $FULLBACKUP > $TMPFILE 2>&1
+  if [ $? -eq 0 ]; then
+    echo "OK"
+  else
+    echo "ERROR"
+  fi
+  check_innobackupex_error
+
+  rm -f $TMPFILE
+  SPENT=$((`date +%s` - $START))
+  echo "Restore completed successfully."
+  echo "Restore duration: `show_time $SPENT`"
+  echo "Restore completed: `date`"
+  echo 
+  echo "Next steps:"
+  echo "1) Verify user and group ownership of files in the data directory."
+  echo "   .e.g. 'chown -R mysql:mysql /path/to/data/dir' if necessary."
+  echo "2) Start MySQL."
+  exit 0
+}
+
+function check_innobackupex_error() {
+  if [ -z "`tail -1 $TMPFILE | grep 'completed OK!'`" ] ; then
+    echo "$INNOBACKUPEX failed:"; echo
+    echo "---------- ERROR OUTPUT from $INNOBACKUPEX ----------"
+    cat $TMPFILE
+    rm -f $TMPFILE
+    exit 1
+  fi
+}
+
+function send_email() {
+  # Replace %BACKUP_STATUS% in subject with actual value
+  EMAIL_SUBJECT=${EMAIL_SUBJECT/\%BACKUP_STATUS\%/$BACKUP_STATUS}
+
+  echo -n "Sending $1 Email to $EMAIL_RECIPIENT..."
+  mail -s "$EMAIL_SUBJECT" $EMAIL_RECIPIENT < $LOGFILE 
+  if [ $? -eq 0 ]; then
+    echo "OK"
+  else
+    echo "FAILED"
+  fi
+}
+
+function get_backup_set_details() {
+  $MYSQL -s $MYSQL_USEROPTIONS -e "SELECT * FROM PERCONA_SCHEMA.xtrabackup_history WHERE name='$1'\G" 2>/dev/null
+  exit 0
+}
+
+function purge_backup_set() {
+  if [ -d "$BASEBACKDIR/$1" ]; then
+    echo "Purged $1"
+    rm -rf $BASEBACKDIR/$1
+  else
+    echo "ERROR: File, $1, not found!"
+  fi
+
+  if [ -d "$INCRBACKDIR/$1" ]; then
+    rm -rf $INCRBACKDIR/$1
+  fi
+  exit 0
+}
+
+function version() {
+  echo "$NAME v$VERSION"
+}
+
+function list_backup_sets() {
+  echo "Backup sets in $BASEBACKDIR:"
+  for FILE in `find $BASEBACKDIR -mindepth 1 -maxdepth 1 -type d -printf "%P\n"`
+  do
+    echo "$FILE"
+
+    if [ -d $INCRBACKDIR/$FILE ]; then
+      for FILE2 in `find $INCRBACKDIR/$FILE -mindepth 1 -maxdepth 1 -type d -printf "%P\n"`
+      do
+        echo "  $FILE2"
+      done
+    fi
+
+  done
+  exit 0  
+}
+
+function create_backup_dirs() {
+  # If full backup dir doesn't exist, try to create it
+  if test ! -d $BASEBACKDIR -o ! -w $BASEBACKDIR  
+  then  
+    mkdir -p $BASEBACKDIR
+  fi  
+
+  # If incr backup dir doesn't exist, try to create it
+  if test ! -d $INCRBACKDIR -o ! -w $INCRBACKDIR  
+  then  
+    mkdir -p $INCRBACKDIR
+  fi  
+}
+
+function get_backup_type() {
+  # Parse into variables
+  stringarray=($BACKUP_RETENTION_POLICY)
+  KEEP=${stringarray[0]}
+  POLICY=${stringarray[1]}
+
+  case $POLICY in
+    minute|minutes)
+    FULLBACKUPLIFE=$((60 * ($KEEP + 1) / 60))  
+    shift # past argument
+    ;;
+
+    hour|hours)
+    FULLBACKUPLIFE=$((3600 * ($KEEP + 1) / 60))  
+    shift # past argument
+    ;;
+
+    day|days)
+    FULLBACKUPLIFE=$((86400 * ($KEEP + 1) / 60))  
+    shift # past argument
+    ;;
+
+    week|weeks)
+    FULLBACKUPLIFE=$((604800 * ($KEEP + 1) / 60))  
+    shift # past argument
+    ;;
+
+    *)
+    FULLBACKUPLIFE=$((604800 * ($KEEP + 1) / 60))  
+   ;;
+  esac
+
+  # Determine if we need to over-rule the user's request for an incremental backup  
+  if [ "$LATEST" ]; then
+    # If there is a full backup, then we need to check its age to see if it is too old
+    AGE=`stat -c %Y $BASEBACKDIR/$LATEST`
+    if [ "$LATEST" -a "$BACKUP_TYPE" = "incr" -a `expr $AGE + $FULLBACKUPLIFE + 5` -le $START ]; then
+      # Since the last full backup is too old, we need to run a full backup regardless
+      MSG="Last full backup is too old, so running a new full backup."
+      BACKUP_TYPE="full"
+    elif [ "$BACKUP_TYPE" = "full" ]; then
+      BACKUP_TYPE="full"
+      MSG=""
+    else
+      BACKUP_TYPE="incr"
+      MSG=""
+    fi
+  else
+    # If there was no full backup, then run a full backup regardless
+    MSG="No full backup found, so running a new full backup."
+    BACKUP_TYPE="full"
+  fi
+}
+
+function dir_exists_is_writable() {
+  # Check dir exists and is writable
+  if test ! -d $1 -o ! -w $1  
+  then
+    echo $1 'does not exist or is not writable'
+    echo
+    exit 1
+  fi
+}
+
+function check_mysql_connection() {
+  if ! $MYSQLADMIN $MYSQL_USEROPTIONS ping > /dev/null 2>&1; then
+    echo "ERROR: MySQL does not appear to be running."
+    echo
+    if [ "$DIE_GRACEFUL" = "yes" ]; then
+      exit 0
+    else
+      exit 1
+    fi
+  fi
+
+  if [ ! `$MYSQL -s $MYSQL_USEROPTIONS -e "SELECT 1" 2>/dev/null` ]; then
+    echo "ERROR: Supplied mysql username or password appears to be incorrect (not copied here for security, see script)"
+    echo
+    exit 1
+  fi
+}
+
+function purge_old_backups() {
+  # Delete old bakcups
+  for DEL in `find $BASEBACKDIR -mindepth 1 -maxdepth 1 -type d -mmin +$FULLBACKUPLIFE -printf "%P\n"`
+  do
+    echo "Deleting old backup: $DEL"
+    rm -rf $BASEBACKDIR/$DEL
+    rm -rf $INCRBACKDIR/$DEL
+  done
+}
+
+function run_incremental_backup() {
+  echo -n 'Running incremental backup...'
+  # Create an incremental backup
+
+  # Check incr sub dir exists
+  # try to create if not
+  if test ! -d $INCRBACKDIR/$LATEST
+  then
+    mkdir $INCRBACKDIR/$LATEST
+  fi
+
+  # Check incr sub dir exists and is writable
+  dir_exists_is_writable $INCRBACKDIR/$LATEST
+
+  LATESTINCR=`find $INCRBACKDIR/$LATEST -mindepth 1  -maxdepth 1 -type d | sort -nr | head -1`
+  if [ ! $LATESTINCR ]; then
+    # This is the first incremental backup
+    INCRBASEDIR=$BASEBACKDIR/$LATEST
+  else
+    # This is a 2+ incremental backup
+    INCRBASEDIR=$LATESTINCR
+  fi
+
+  # Create incremental Backup
+  $INNOBACKUPEX --history=$LATEST $INNOBACKUPEX_USEROPTIONS $FILTERTABLES $INNOBACKUPEX_INCR_BACKUP_OPTIONS --incremental $INCRBACKDIR/$LATEST --incremental-basedir=$INCRBASEDIR > $LOGFILE 2>&1
+  BACKUPDIR=$INCRBACKDIR/$LATEST
+}
+
+function run_full_backup() {
+  echo -n 'Running full backup...'
+
+  # Get directory name
+  TS=`date +%Y-%m-%d_%H-%M-%S`
+
+  # Create a new full backup
+  $INNOBACKUPEX --history=$TS $INNOBACKUPEX_USEROPTIONS $FILTERTABLES $INNOBACKUPEX_FULL_BACKUP_OPTIONS $BASEBACKDIR/$TS --no-timestamp > $LOGFILE 2>&1
+
+  LATEST=`find $BASEBACKDIR -mindepth 1 -maxdepth 1 -type d -printf "%P\n" | sort -nr | head -1`
+  BACKUPDIR=$BASEBACKDIR/$LATEST
+}
+
+function check_backup_status() {
+  # Determine backup status
+  if [ -z "`tail -1 $LOGFILE | grep 'completed OK!'`" ]; then
+    echo "FAILED!"
+    BACKUP_STATUS="Failed"
+    echo "Backup failed:"
+    echo
+    echo "---------- ERROR OUTPUT from $INNOBACKUPEX ----------"
+    cat $LOGFILE
+  
+    if [ "$CLEANUP_FAILED_BACKUPS" = "yes" ]; then
+      rm -rf $BACKUPDIR
+    fi
+
+    if [ "$EMAIL_ON_FAILURE" = "yes" ]; then
+      send_email $BACKUP_STATUS
+    fi
+    exit 1
+  else
+    echo "OK"
+    BACKUP_STATUS="Success"
+
+    if [ "$EMAIL_ON_SUCCESS" = "yes" ]; then
+      send_email $BACKUP_STATUS
+    fi
+  fi
+
+  THISBACKUP=`awk -- "/Backup created in directory/ { split( \\\$0, p, \"'\" ) ; print p[2] }" $LOGFILE`
+
+  echo "Backup location: $THISBACKUP"
+
+  move_backup_log
+}
+
+function latest_backup_directory() {
+  # Find latest backup directory
+  LATEST=`find $BASEBACKDIR -mindepth 1 -maxdepth 1 -type d -printf "%P\n" | sort -nr | head -1`
+}
+
+function run_backup() {
+  if [ "$COMPACT" = "yes" ]; then
+    INNOBACKUPEX_FULL_BACKUP_OPTIONS="$INNOBACKUPEX_FULL_BACKUP_OPTIONS --compact"
+    INNOBACKUPEX_INCR_BACKUP_OPTIONS="$INNOBACKUPEX_INCR_BACKUP_OPTIONS --compact"
+  fi
+
+  if [ "$COMPRESS" = "yes" ]; then
+    INNOBACKUPEX_FULL_BACKUP_OPTIONS="$INNOBACKUPEX_FULL_BACKUP_OPTIONS --compress --compress-threads=$THREADS"
+    INNOBACKUPEX_INCR_BACKUP_OPTIONS="$INNOBACKUPEX_INCR_BACKUP_OPTIONS --compress --compress-threads=$THREADS" 
+  fi
+
+  if [ -f "$MYCNF_EXTRA" ]; then
+    INNOBACKUPEX_FULL_BACKUP_OPTIONS="$INNOBACKUPEX_FULL_BACKUP_OPTIONS --defaults-extra-file=$MYCNF_EXTRA"
+    INNOBACKUPEX_INCR_BACKUP_OPTIONS="$INNOBACKUPEX_INCR_BACKUP_OPTIONS --defaults-extra-file=$MYCNF_EXTRA" 
+  fi
+
+  header
+  create_backup_dirs
+  dir_exists_is_writable $BASEBACKDIR
+  dir_exists_is_writable $INCRBACKDIR
+  check_mysql_connection
+  latest_backup_directory
+  get_backup_type
+  if [ "$WHEN_PURGE_OLD_BACKUPS" = "before" ]; then
+    purge_old_backups
+    latest_backup_directory
+    get_backup_type
+  fi
+
+  if [ "$MSG" ]; then
+    echo "Warning: $MSG"
+  fi
+
+  if [ "$BACKUP_TYPE" = "incr" ]; then
+    run_incremental_backup
+  else
+    run_full_backup
+  fi
+
+  check_backup_status
+  if [ "$WHEN_PURGE_OLD_BACKUPS" = "after" ]; then
+    purge_old_backups
+  fi
+  footer
+  exit 0
+}
+
+function move_backup_log() {
+  # Move the log file to backupdir
+  if [ -f "$LOGFILE" ]; then
+    mv $LOGFILE $BACKUPDIR
+  fi
+}
+
+function header() {
+  # Start Output
+  echo "+---------------------------+"
+  echo " `version`"
+  echo "+---------------------------+"
+  echo "Backup started: `date`"
+}
+
+function show_time() {
+  num=$1
+  min=0
+  hour=0
+  if((num>59));then
+    ((sec=num%60))
+    ((num=num/60))
+    if((num>59));then
+      ((min=num%60))
+      ((num=num/60))
+      ((hour=num))
+    else
+      ((min=num))
+    fi
+  else
+    ((sec=num))
+  fi
+
+  if [ $hour -lt 10 ]; then
+    hour="0$hour"
+  fi
+  if [ $min -lt 10 ]; then
+    min="0$min"
+  fi
+  if [ $sec -lt 10 ]; then
+    sec="0$sec"
+  fi
+  echo "$hour:$min:$sec"
+}
+
+function footer() {
+  SPENT=$((`date +%s` - $START))
+  echo "Backup duration: `show_time $SPENT`"
+  echo "Backup completed: `date`"
+  exit 0
+}
+
+function help() {
+  version
+  echo "Open source backup wrapper script for Percona's XTRABackup tool"
+  echo "Written by Mike Patrick"
+  echo
+  echo "Copyright (C) 2015 Itchy Ninja Software and/or its affiliates."
+  echo
+  echo "This program is free software; you can redistribute it and/or"
+  echo "modify it under the terms of the GNU General Public License"
+  echo "as published by the Free Software Foundation version 2"
+  echo "of the License."
+  echo
+  echo "This program is distributed in the hope that it will be useful,"
+  echo "but WITHOUT ANY WARRANTY; without even the implied warranty of"
+  echo "MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the"
+  echo "GNU General Public License for more details."
+  echo 
+  echo "You can download full text of the license at"
+  echo "http://www.gnu.org/licenses/gpl-2.0.txt"
+  echo
+  echo "Usage: $SELF [option]"
+  echo "  -d SET, --details SET     Get details of backup set"
+  echo "  -f, --full                Run full backup"
+  echo "  -i, --incr                Run incremental backup"
+  echo "  -l, --list                List backup sets"
+  echo "  -p SET, --purge SET       Purge backup set"
+  echo "  -r PATH, --restore PATH   Restore backup from specified path"
+  echo "  -v, --version             Show the version of this utility"
+  echo "  -h, --help                List this help"
+  echo
+  echo "The parameter \"SET\" refers to the name of the backup set as shown"
+  echo "by running this utility with the \"--list\" option."
+  echo
+  echo "If no option(s) are given, the program will determine the proper"
+  echo "type of backup (full or incremental) to be executed."
+  echo 
+  echo "This script can be easily used with a crontab by either defining"
+  echo "a backup type with either the \"--full\" or the \"--incr\" option"
+  echo "or by simply allowing the utility to decide what type of backup"
+  echo "is needed."
+  echo
+  exit 0
+}
+
+if [ -z $1 ]; then
+  # No options specified
+  help
+fi
+
+# Parse command line arguments
+while [[ $# > 0 ]]
+do
+key="$1"
+case $key in
+    -d|--details)
+    get_backup_set_details $2
+    shift # past argument
+    ;;
+
+    -f|--full)
+    BACKUP_TYPE="full"
+    run_backup
+    shift # past argument
+    ;;
+
+    -i|--incr)
+    BACKUP_TYPE="incr"
+    run_backup
+    shift # past argument
+    ;;
+
+    -l|--list)
+    list_backup_sets
+    shift # past argument
+    ;;
+
+    -p|--purge)
+    purge_backup_set $2
+    shift # past argument
+    ;;
+
+    -r|--restore)
+    if [ $2 ]; then
+      restore $2
+    else
+      help
+    fi
+    shift # past argument
+    ;;
+
+    -h|--help)
+    help
+    shift # past argument
+    ;;
+
+    -v|--version)
+    version
+    exit 0
+    shift # past argument
+    ;;
+
+    *)
+    help
+    ;;
+esac
+shift # past argument or value
+done
+exit 0

@@ -1,0 +1,5 @@
+When doing a new version:
+create a new source-x.x directory
+modify the version number in the source file
+modify the version number in the spec file
+modify the version number in the makerpm.sh file

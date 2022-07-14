@@ -1,0 +1,3 @@
+Required to be specified in my.cnf for recovery: 
+innodb_data_file_path
+datadir

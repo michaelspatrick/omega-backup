@@ -1,0 +1,3 @@
+# Omega Backups for MySQL:
+0 0 * * Sun /usr/bin/omega-backup --full > /dev/null 2>&1
+0 0 * * Mon-Sat /usr/bin/omega-backup --incr > /dev/null 2>&1
